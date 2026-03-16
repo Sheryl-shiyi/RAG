@@ -183,7 +183,7 @@ deploy/helm/secrets
 # RAG Stack Configuration
 # User-specific configuration file (contains sensitive data)
 deploy/helm/rag-values.yaml
-deploy/helm/rag/Chart.lock
 deploy/helm/values.yaml
 deploy/helm/bootstrap-values.yaml
 tenant/bootstrap/bootstrap-values.yaml
+tenant/bootstrap-values.yaml
