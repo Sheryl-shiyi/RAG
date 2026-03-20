@@ -13,7 +13,7 @@ import logging
 import streamlit as st
 
 from llama_stack_ui.distribution.ui.modules.api import llama_stack_api
-from llama_stack_ui.distribution.ui.modules.utils import clean_text, get_vector_db_name
+from llama_stack_ui.distribution.ui.modules.utils import clean_text, get_vector_db_name, strip_file_citations, strip_file_citations_streaming, run_input_shields, run_output_shields
 
 
 logger = logging.getLogger(__name__)
@@ -131,22 +131,8 @@ def handle_agent_output_item_done(chunk, state):
     item_type = getattr(item, 'type', None)
 
     if item_type == "file_search_call":
-        # File search results
-        if hasattr(item, 'results') and item.results:
-            display_results = []
-            for r in item.results:
-                text = getattr(r, 'text', '')
-                attrs = getattr(r, 'attributes', {})
-                source = attrs.get('source') or getattr(r, 'filename', 'unknown')
-                display_results.append({"source": source, "text": clean_text(text)})
-            state.tool_results.append({
-                'title': '📄 File Search Results',
-                'type': 'json',
-                'content': display_results
-            })
-            with state.containers.tool_results:
-                with st.expander("📄 File Search Results", expanded=False):
-                    st.json(display_results)
+        # Results are fetched explicitly per-DB after streaming completes
+        pass
 
     elif item_type == "web_search_call":
         # Web search - API doesn't expose raw results, just status
@@ -235,13 +221,90 @@ def handle_chunk_completed(chunk):
 
 def handle_chunk_done(chunk, state):
     """Handle done chunk and finalize response."""
-    has_output = (
-        hasattr(chunk, 'response') and
-        hasattr(chunk.response, 'output_text') and
-        chunk.response.output_text
+    if not hasattr(chunk, 'response'):
+        return
+
+    response = chunk.response
+
+    if hasattr(response, 'output_text') and response.output_text:
+        state.full_response = strip_file_citations(response.output_text)
+
+
+def search_vector_stores_fallback(prompt, selected_vector_dbs, state):
+    """
+    Explicitly search vector stores when the Responses API stream didn't
+    include file_search results (common on subsequent conversation turns).
+    """
+    client = llama_stack_api.client
+    vector_dbs = list(client.vector_stores.list() or [])
+
+    selected_vdb_objects = [
+        vdb for vdb in vector_dbs
+        if get_vector_db_name(vdb) in selected_vector_dbs
+    ]
+    if not selected_vdb_objects:
+        return
+
+    db_label = "vector store" if len(selected_vdb_objects) == 1 else "vector stores"
+    status_msg = (
+        f"🛠 :grey[_Using file_search tool with {db_label}: "
+        f"{', '.join(selected_vector_dbs)}_]"
     )
-    if has_output:
-        state.full_response = chunk.response.output_text
+    state.tool_status = status_msg
+    with state.containers.tool_status:
+        st.markdown(status_msg)
+
+    for vdb in selected_vdb_objects:
+        vdb_id = vdb.id
+        vdb_name = get_vector_db_name(vdb)
+
+        try:
+            search_response = client.vector_stores.search(
+                vector_store_id=vdb_id,
+                query=prompt,
+            )
+        except Exception as e:
+            logger.debug("Fallback search failed for %s: %s", vdb_id, e)
+            continue
+
+        search_results = None
+        if hasattr(search_response, 'data') and search_response.data:
+            search_results = search_response.data
+        elif hasattr(search_response, 'chunks') and search_response.chunks:
+            search_results = search_response.chunks
+        elif hasattr(search_response, 'results') and search_response.results:
+            search_results = search_response.results
+
+        if not search_results:
+            continue
+
+        display_results = []
+        for result in search_results:
+            text = None
+            if hasattr(result, 'content') and isinstance(result.content, list):
+                for content_item in result.content:
+                    if hasattr(content_item, 'text'):
+                        text = content_item.text
+                        break
+            elif hasattr(result, 'content') and isinstance(result.content, str):
+                text = result.content
+            elif hasattr(result, 'text'):
+                text = result.text
+
+            if text:
+                attrs = getattr(result, 'attributes', {})
+                source = attrs.get('source') or getattr(result, 'filename', 'unknown')
+                display_results.append({"source": source, "text": clean_text(text)})
+
+        if display_results:
+            state.tool_results.append({
+                'title': f"📄 File Search Results from '{vdb_name}'",
+                'type': 'json',
+                'content': display_results
+            })
+            with state.containers.tool_results:
+                with st.expander(f"📄 File Search Results from '{vdb_name}'", expanded=False):
+                    st.json(display_results)
 
 
 def process_chunk_by_type(chunk, state, selected_vector_dbs):
@@ -272,7 +335,7 @@ def process_chunk_by_type(chunk, state, selected_vector_dbs):
     # Handle message content
     elif chunk_type == "response.output_text.delta":
         if hasattr(chunk, 'delta') and chunk.delta:
-            state.update_message(chunk.delta)
+            state.update_message(chunk.delta, display_fn=strip_file_citations_streaming)
 
     # Handle errors
     elif chunk_type == "response.failed":
@@ -305,18 +368,6 @@ def stream_agent_response(response, state, selected_vector_dbs):
         logger.debug("Chunk #%s: type=%s", chunk_count, getattr(chunk, 'type', 'NO_TYPE'))
         logger.debug("  -> Full chunk: %s", chunk)
 
-        # Some server failures arrive as an error payload with type=None.
-        if hasattr(chunk, 'error') and chunk.error:
-            if isinstance(chunk.error, dict):
-                error_msg = chunk.error.get("message", "Unknown error")
-            else:
-                error_msg = str(chunk.error)
-            st.error(
-                f"❌ Error: {error_msg}"
-            )
-            logger.debug("Response stream error: %s", error_msg)
-            break
-
         if hasattr(chunk, 'type'):
             should_stop = process_chunk_by_type(chunk, state, selected_vector_dbs)
             if should_stop:
@@ -325,6 +376,17 @@ def stream_agent_response(response, state, selected_vector_dbs):
 
 def save_agent_response_to_session(state):
     """Save agent response to session state."""
+    if state.guardrail_blocked:
+        response_dict = {
+            "role": "assistant",
+            "content": f"🛡️ {state.guardrail_blocked}",
+            "guardrail_blocked": state.guardrail_blocked,
+            "stop_reason": "end_of_message",
+        }
+        st.session_state.messages.append(response_dict)
+        return
+
+    state.full_response = strip_file_citations(state.full_response)
     state.finalize_reasoning()
     state.finalize_message()
 
@@ -344,8 +406,34 @@ def save_agent_response_to_session(state):
     st.session_state.messages.append(response_dict)
 
 
+def _get_live_shields(config):
+    """Read guardrail selections directly from widget state to avoid stale config."""
+    input_shields = st.session_state.get("guardrail_input_selector", config.guardrails.input_shields)
+    output_shields = st.session_state.get("guardrail_output_selector", config.guardrails.output_shields)
+    return input_shields or [], output_shields or []
+
+
 def agent_process_prompt(prompt, state, config):
     """Agent-based mode: Use Responses API with automatic tool calling."""
+    input_shields, output_shields = _get_live_shields(config)
+
+    # Run input guardrails before calling the API
+    if input_shields:
+        guardrail_status = state.containers.tool_status.empty()
+        guardrail_status.markdown("🛡️ :grey[_Running input guardrail check..._]")
+        is_blocked, violation_msg, blocked_shield = run_input_shields(
+            llama_stack_api.client, input_shields, prompt
+        )
+        if is_blocked:
+            guardrail_status.empty()
+            blocked_msg = f"**Input Guardrail Triggered** (`{blocked_shield}`): {violation_msg}"
+            st.warning(blocked_msg, icon="🛡️")
+            state.guardrail_blocked = blocked_msg
+            state.full_response = ""
+            save_agent_response_to_session(state)
+            return
+        guardrail_status.empty()
+
     # Build tools list from selected toolgroups
     tools = build_response_tools(
         config.toolgroup_selection,
@@ -371,6 +459,7 @@ def agent_process_prompt(prompt, state, config):
         request_kwargs["tools"] = tools
 
     logger.debug("Request: %s", request_kwargs)
+    state.show_thinking()
     try:
         response = llama_stack_api.client.responses.create(**request_kwargs)
     except Exception as e:  # pylint: disable=broad-exception-caught
@@ -380,6 +469,30 @@ def agent_process_prompt(prompt, state, config):
 
     # Stream response and update UI
     stream_agent_response(response, state, config.selected_vector_dbs)
+
+    # Run output guardrails after response is fully streamed but before search results
+    if output_shields and state.full_response:
+        guardrail_status = state.containers.tool_status.empty()
+        guardrail_status.markdown("🛡️ :grey[_Running output guardrail check..._]")
+        is_blocked, violation_msg, blocked_shield = run_output_shields(
+            llama_stack_api.client, output_shields, prompt, state.full_response
+        )
+        guardrail_status.empty()
+        if is_blocked:
+            blocked_msg = f"**Output Guardrail Triggered** (`{blocked_shield}`): {violation_msg}"
+            state.containers.clear_tools()
+            state.containers.message.empty()
+            st.warning(blocked_msg, icon="🛡️")
+            state.guardrail_blocked = blocked_msg
+            state.full_response = ""
+            state.tool_results = []
+            state.tool_status = None
+            save_agent_response_to_session(state)
+            return
+
+    # Fetch file search results only if response was not blocked
+    if config.selected_vector_dbs:
+        search_vector_stores_fallback(prompt, config.selected_vector_dbs, state)
 
     # Save response to session
     save_agent_response_to_session(state)
