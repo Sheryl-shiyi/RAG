@@ -14,7 +14,7 @@ import traceback
 import streamlit as st
 
 from llama_stack_ui.distribution.ui.modules.api import llama_stack_api
-from llama_stack_ui.distribution.ui.modules.utils import clean_text, get_vector_db_name
+from llama_stack_ui.distribution.ui.modules.utils import clean_text, get_vector_db_name, run_input_shields, run_output_shields
 
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,6 @@ def extract_text_from_search_result(result):
 
 def search_vector_store_direct(prompt, vector_db_id, vector_db_name, top_k, state):
     """Search vector store and extract context for Direct mode."""
-    search_results = []
     context_parts = []
     display_results = []
 
@@ -71,6 +70,8 @@ def search_vector_store_direct(prompt, vector_db_id, vector_db_name, top_k, stat
     logger.debug("Search response: %s", search_response)
 
     # Extract search results from response
+    search_results = []
+
     if hasattr(search_response, 'data') and search_response.data:
         search_results = search_response.data
     elif hasattr(search_response, 'chunks') and search_response.chunks:
@@ -89,8 +90,13 @@ def search_vector_store_direct(prompt, vector_db_id, vector_db_name, top_k, stat
                 context_parts.append(f"[Source: {source}]: {text_content}")
                 display_results.append({"source": source, "text": text_content})
 
+        state.tool_results.append({
+            'title': f"📄 File Search Results from '{vector_db_name}'",
+            'type': 'json',
+            'content': display_results
+        })
         with state.containers.tool_results:
-            with st.expander(f"📄 Search Results from '{vector_db_name}'", expanded=False):
+            with st.expander(f"📄 File Search Results from '{vector_db_name}'", expanded=False):
                 st.json(display_results)
 
         logger.debug("Built context with %s documents", len(context_parts))
@@ -135,7 +141,7 @@ def stream_completions_direct(completion_response, state):
     """Stream chunks from Completions API and update state."""
     for chunk in completion_response:
         logger.debug("Completion chunk: %s", chunk)
-        if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
+        if hasattr(chunk, 'choices') and chunk.choices:
             delta = chunk.choices[0].delta
 
             # Handle reasoning content (for models that support it like R1)
@@ -149,6 +155,16 @@ def stream_completions_direct(completion_response, state):
 
 def save_direct_response_to_session(state, all_search_results):
     """Save direct response to session state."""
+    if state.guardrail_blocked:
+        response_dict = {
+            "role": "assistant",
+            "content": f"🛡️ {state.guardrail_blocked}",
+            "guardrail_blocked": state.guardrail_blocked,
+            "stop_reason": "end_of_message",
+        }
+        st.session_state.messages.append(response_dict)
+        return
+
     state.finalize_reasoning()
     state.finalize_message()
 
@@ -167,7 +183,7 @@ def save_direct_response_to_session(state, all_search_results):
         db_names = [name for name, _ in all_search_results]
         response_dict["tool_results"] = [
             {
-                'title': f'📄 Search Results from \'{name}\'',
+                'title': f'📄 File Search Results from \'{name}\'',
                 'type': 'json',
                 'content': display
             }
@@ -184,8 +200,16 @@ def save_direct_response_to_session(state, all_search_results):
 # Direct Mode - Main Function
 # ============================================================================
 
+def _get_live_shields(config):
+    """Read guardrail selections directly from widget state to avoid stale config."""
+    input_shields = st.session_state.get("guardrail_input_selector", config.guardrails.input_shields)
+    output_shields = st.session_state.get("guardrail_output_selector", config.guardrails.output_shields)
+    return input_shields or [], output_shields or []
+
+
 def direct_process_prompt(prompt, state, config):
     """Direct mode: Manual RAG with completions API."""
+    input_shields, output_shields = _get_live_shields(config)
     context_parts = []
     all_search_results = []
 
@@ -194,7 +218,24 @@ def direct_process_prompt(prompt, state, config):
         logger.debug("No vector DB selected - normal chat mode")
 
     try:
-        # Step 1: Search each selected vector store
+        # Step 0: Run input guardrails
+        if input_shields:
+            guardrail_status = state.containers.tool_status.empty()
+            guardrail_status.markdown("🛡️ :grey[_Running input guardrail check..._]")
+            is_blocked, violation_msg, blocked_shield = run_input_shields(
+                llama_stack_api.client, input_shields, prompt
+            )
+            if is_blocked:
+                guardrail_status.empty()
+                blocked_msg = f"**Input Guardrail Triggered** (`{blocked_shield}`): {violation_msg}"
+                st.warning(blocked_msg, icon="🛡️")
+                state.guardrail_blocked = blocked_msg
+                state.full_response = ""
+                save_direct_response_to_session(state, [])
+                return
+            guardrail_status.empty()
+
+        # Step 1: Search each selected vector store (renders results immediately)
         for vector_db in vector_dbs:
             vector_db_id = vector_db.id
             vector_db_name = get_vector_db_name(vector_db)
@@ -205,6 +246,12 @@ def direct_process_prompt(prompt, state, config):
                 all_search_results.append((vector_db_name, display))
             context_parts.extend(parts)
 
+        # Update tool status to final state
+        if all_search_results:
+            db_names = [name for name, _ in all_search_results]
+            status_msg = f"🛠 :grey[_Searched vector stores: {', '.join(db_names)}_]"
+            state.tool_status = status_msg
+
         # Step 2: Build messages (with or without RAG context)
         messages = build_rag_messages(prompt, context_parts, config.system_prompt)
 
@@ -213,6 +260,7 @@ def direct_process_prompt(prompt, state, config):
         for i, msg in enumerate(messages):
             logger.debug("  Message %s (%s): %s...", i, msg['role'], msg['content'][:200])
 
+        state.show_thinking()
         completion_response = llama_stack_api.client.chat.completions.create(
             model=config.model,
             messages=messages,
@@ -224,7 +272,25 @@ def direct_process_prompt(prompt, state, config):
         # Step 4: Stream response and update UI
         stream_completions_direct(completion_response, state)
 
-        # Step 5: Save to session
+        # Step 5: Run output guardrails
+        if output_shields and state.full_response:
+            guardrail_status = state.containers.tool_status.empty()
+            guardrail_status.markdown("🛡️ :grey[_Running output guardrail check..._]")
+            is_blocked, violation_msg, blocked_shield = run_output_shields(
+                llama_stack_api.client, output_shields, prompt, state.full_response
+            )
+            guardrail_status.empty()
+            if is_blocked:
+                blocked_msg = f"**Output Guardrail Triggered** (`{blocked_shield}`): {violation_msg}"
+                state.containers.clear_tools()
+                state.containers.message.empty()
+                st.warning(blocked_msg, icon="🛡️")
+                state.guardrail_blocked = blocked_msg
+                state.full_response = ""
+                save_direct_response_to_session(state, [])
+                return
+
+        # Step 6: Save to session
         save_direct_response_to_session(state, all_search_results)
 
     except Exception as e:

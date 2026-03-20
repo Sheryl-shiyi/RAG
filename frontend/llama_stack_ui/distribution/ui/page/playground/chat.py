@@ -18,6 +18,7 @@ from llama_stack_ui.distribution.ui.modules.api import llama_stack_api
 from llama_stack_ui.distribution.ui.modules.utils import (
     get_suggestions_for_databases,
     get_vector_db_name,
+    fetch_available_shields, 
 )
 from llama_stack_ui.distribution.ui.page.playground.agent import (
     agent_process_prompt,
@@ -42,6 +43,10 @@ def render_tool_results(tool_results):
 def render_message(msg):
     """Render a single message in chat history."""
     with st.chat_message(msg['role']):
+        if msg.get('guardrail_blocked'):
+            st.warning(msg['guardrail_blocked'], icon="🛡️")
+            return
+
         # Display tool status if present
         if msg.get('tool_status'):
             st.markdown(msg['tool_status'])
@@ -56,7 +61,8 @@ def render_message(msg):
                 st.markdown(msg['reasoning'])
 
         # Display the final answer
-        st.markdown(msg['content'])
+        if msg.get('content'):
+            st.markdown(msg['content'])
 
 
 def render_history():
@@ -70,13 +76,20 @@ def render_history():
 
 
 def fetch_models_and_tools():
-    """Fetch and categorize models and toolgroups from LlamaStack."""
+    """Fetch and categorize models, toolgroups, and shields from LlamaStack."""
     client = llama_stack_api.client
 
-    # Fetch models
+    # Fetch available shields first so we can exclude them from the model list
+    shields_list = fetch_available_shields(client)
+    logger.debug("Available shields: %s", shields_list)
+    shields_set = set(shields_list)
+
+    # Fetch models, excluding guardrail/shield models
     models = client.models.list()
-    model_list = [model.id for model in models if model.custom_metadata.get("model_type") == "llm"]
-    
+    model_list = [
+        model.identifier for model in models
+        if model.api_model_type == "llm" and model.identifier not in shields_set
+    ]
 
     # Fetch and categorize toolgroups
     tool_groups = client.toolgroups.list()
@@ -90,7 +103,7 @@ def fetch_models_and_tools():
     builtin_tools_list = [tool for tool in tool_groups_list if not tool.startswith("mcp::")]
     logger.debug("Built-in tools: %s", builtin_tools_list)
 
-    return model_list, builtin_tools_list, mcp_tools_list
+    return model_list, builtin_tools_list, mcp_tools_list, shields_list
 
 
 def render_toolgroup_selection(builtin_tools_list, mcp_tools_list, selected_vector_dbs,
@@ -159,6 +172,14 @@ def reset_agent():
     st.cache_resource.clear()
 
 
+def reset_conversation():
+    """Reset conversation messages without clearing widget configuration."""
+    keys_to_clear = ["messages", "conversation_id", "show_more_questions", "selected_question", "direct_vector_dbs"]
+    for key in keys_to_clear:
+        st.session_state.pop(key, None)
+    st.cache_resource.clear()
+
+
 def create_vector_db_callbacks(processing_mode, vector_dbs):
     """Create callbacks for vector DB and toolgroup synchronization."""
     def on_vector_db_change():
@@ -197,7 +218,35 @@ def create_vector_db_callbacks(processing_mode, vector_dbs):
     return on_vector_db_change, on_toolgroup_change
 
 
-def render_sidebar_configuration(model_list, builtin_tools_list, mcp_tools_list):
+def render_guardrails_selection(shields_list):
+    """Render guardrail selection UI in the sidebar."""
+    st.subheader("Guardrails")
+
+    if not shields_list:
+        st.caption("No guardrails available on this server.")
+        return [], []
+
+    input_shields = st.multiselect(
+        "Input Guardrails",
+        options=shields_list,
+        key="guardrail_input_selector",
+        on_change=reset_conversation,
+        help="Safety guardrails to check user input before processing.",
+    )
+
+    output_shields = st.multiselect(
+        "Output Guardrails",
+        options=shields_list,
+        key="guardrail_output_selector",
+        on_change=reset_conversation,
+        help="Safety guardrails to check assistant response after generation.",
+    )
+
+    return input_shields, output_shields
+
+
+def render_sidebar_configuration(model_list, builtin_tools_list, mcp_tools_list,
+                                  shields_list):
     """Render sidebar configuration and return selected parameters."""
     st.title("Configuration")
     st.subheader("Model")
@@ -238,6 +287,9 @@ def render_sidebar_configuration(model_list, builtin_tools_list, mcp_tools_list)
             builtin_tools_list, mcp_tools_list, selected_vector_dbs,
             on_toolgroup_change, reset_agent
         )
+
+    # Guardrails Selection
+    input_shields, output_shields = render_guardrails_selection(shields_list)
 
     # Sampling Parameters
     st.subheader("Sampling Parameters")
@@ -287,6 +339,8 @@ def render_sidebar_configuration(model_list, builtin_tools_list, mcp_tools_list)
         'max_infer_iters': max_infer_iters,
         'max_tokens': max_tokens,
         'system_prompt': system_prompt,
+        'input_shields': input_shields,
+        'output_shields': output_shields,
     }
 
 
@@ -365,6 +419,13 @@ class SamplingParams:
 
 
 @dataclass
+class GuardrailConfig:
+    """Configuration for safety guardrails."""
+    input_shields: list
+    output_shields: list
+
+
+@dataclass
 class ChatConfig:
     """Configuration for chat processing."""
     model: str
@@ -374,6 +435,7 @@ class ChatConfig:
     toolgroup_selection: list
     selected_vector_dbs: list
     sampling: SamplingParams
+    guardrails: GuardrailConfig
 
 
 # ============================================================================
@@ -386,11 +448,19 @@ class Containers:
     Note: Containers are created in visual display order (top to bottom).
     """
     def __init__(self):
-        # Create containers in visual order: tools -> reasoning -> message
-        self.tool_status = st.container()
-        self.tool_results = st.container()
+        # Create containers in visual order: tools -> thinking -> reasoning -> message
+        self._tool_status_slot = st.empty()
+        self.tool_status = self._tool_status_slot.container()
+        self._tool_results_slot = st.empty()
+        self.tool_results = self._tool_results_slot.container()
+        self.thinking = st.container()
         self.reasoning = st.empty()
         self.message = st.empty()
+
+    def clear_tools(self):
+        """Clear all rendered tool status and results."""
+        self._tool_status_slot.empty()
+        self._tool_results_slot.empty()
 
 class ResponseState:
     """
@@ -400,6 +470,9 @@ class ResponseState:
     def __init__(self):
         # UI containers (grouped)
         self.containers = Containers()
+
+        # Thinking indicator state
+        self._thinking_active = False
 
         # Reasoning state
         self.reasoning_text = ""
@@ -412,6 +485,9 @@ class ResponseState:
         # Response content
         self.full_response = ""
 
+        # Guardrail block message (set when a shield blocks the request/response)
+        self.guardrail_blocked = None
+
     @property
     def has_reasoning(self):
         """Check if reasoning has been started."""
@@ -422,8 +498,21 @@ class ResponseState:
         """Check if any tool has been used."""
         return self.tool_status is not None
 
+    def show_thinking(self):
+        """Show a 'Thinking...' progress indicator."""
+        self._thinking_active = True
+        self._thinking_placeholder = self.containers.thinking.empty()
+        self._thinking_placeholder.status("Thinking...", state="running")
+
+    def dismiss_thinking(self):
+        """Dismiss the thinking indicator if active."""
+        if self._thinking_active:
+            self._thinking_active = False
+            self._thinking_placeholder.empty()
+
     def update_reasoning(self, delta_text):
         """Add reasoning text and update display."""
+        self.dismiss_thinking()
         self.reasoning_text += delta_text
 
         # Create reasoning expander on first delta
@@ -441,10 +530,12 @@ class ResponseState:
         if self.reasoning_placeholder and self.reasoning_text:
             self.reasoning_placeholder.markdown(self.reasoning_text)
 
-    def update_message(self, delta_text):
+    def update_message(self, delta_text, display_fn=None):
         """Add message text and update display."""
+        self.dismiss_thinking()
         self.full_response += delta_text
-        self.containers.message.markdown(self.full_response + "▌")
+        display_text = display_fn(self.full_response) if display_fn else self.full_response
+        self.containers.message.markdown(display_text + "▌")
 
     def finalize_message(self):
         """Remove cursor from message display."""
@@ -551,13 +642,13 @@ def tool_chat_page():
     """Main chat page with RAG support in Direct and Agent-based modes."""
     st.title("💬 Chat")
 
-    # Fetch models and tools
-    model_list, builtin_tools_list, mcp_tools_list = fetch_models_and_tools()
+    # Fetch models, tools, and shields
+    model_list, builtin_tools_list, mcp_tools_list, shields_list = fetch_models_and_tools()
 
     # Render sidebar and get configuration
     with st.sidebar:
         sidebar_config = render_sidebar_configuration(
-            model_list, builtin_tools_list, mcp_tools_list
+            model_list, builtin_tools_list, mcp_tools_list, shields_list
         )
 
     # Initialize session state
@@ -576,7 +667,11 @@ def tool_chat_page():
             top_k=sidebar_config['top_k'],
             max_infer_iters=sidebar_config['max_infer_iters'],
             max_tokens=sidebar_config['max_tokens'],
-        )
+        ),
+        guardrails=GuardrailConfig(
+            input_shields=sidebar_config['input_shields'],
+            output_shields=sidebar_config['output_shields'],
+        ),
     )
 
     # Display chat history
