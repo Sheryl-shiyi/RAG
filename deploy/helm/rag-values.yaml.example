@@ -180,6 +180,17 @@ llama-stack:
     # OPENAI_API_KEY: "your_openai_key_here"
     # ANTHROPIC_API_KEY: "your_anthropic_key_here"
 
+  # File Processors Configuration
+  #
+  # Available providers:
+  #   inline::pypdf        - PDF extraction (lightweight, uses PyPDF)
+  #
+  fileProcessors:
+    enabled: true
+    providers:
+      - provider_id: pypdf
+        provider_type: inline::pypdf
+
 # Suggested Questions Configuration
 # These questions appear in the chat UI when users select a database
 # The key should match the vector_store_name (identifier) of the database

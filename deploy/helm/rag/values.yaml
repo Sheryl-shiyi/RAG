@@ -189,6 +189,12 @@ pgvector:
 
 llama-stack:
   enabled: true
+  fileProcessors:
+    enabled: true
+    providers:
+      - provider_id: pypdf
+        provider_type: inline::pypdf
+
   secrets:
     TAVILY_SEARCH_API_KEY: "Paste-your-key-here"
 
