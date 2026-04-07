@@ -3,7 +3,7 @@ replicaCount: 1
 image:
   repository: quay.io/rh-ai-quickstart/llamastack-dist-ui
   pullPolicy: Always
-  tag: 0.2.38
+  tag: latest-dev
 
 service:
   type: ClusterIP
@@ -165,6 +165,19 @@ pgvector:
     host: pgvector
     port: "5432"
   
+  # Create a separate vector database for each ingestion pipeline
+  extraDatabases:
+    - name: hr_vector_db
+      vectordb: true
+    - name: legal_vector_db
+      vectordb: true
+    - name: sales_vector_db
+      vectordb: true
+    - name: procurement_vector_db
+      vectordb: true
+    - name: techsupport_vector_db
+      vectordb: true
+
     # Upload sample files to the minio bucket 
   sampleFileUpload:
     enabled: true
@@ -176,6 +189,12 @@ pgvector:
 
 llama-stack:
   enabled: true
+  fileProcessors:
+    enabled: true
+    providers:
+      - provider_id: pypdf
+        provider_type: inline::pypdf
+
   secrets:
     TAVILY_SEARCH_API_KEY: "Paste-your-key-here"
 
