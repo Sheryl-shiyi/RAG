@@ -79,6 +79,7 @@ def strip_file_citations(text):
     """
     text = re.sub(r'file<[^>]+>', '', text)
     text = re.sub(r'<\|file-[^|]*\|>', '', text)
+    text = re.sub(r'<\|[0-9a-fA-F-]{8,}\|>', '', text)
     text = re.sub(r'【[^】]*†[^】]*】', '', text)
     text = re.sub(r'  +', ' ', text)
     return text
@@ -92,6 +93,7 @@ def strip_file_citations_streaming(text):
     """
     text = strip_file_citations(text)
     text = re.sub(r'<\|(?:f(?:i(?:l(?:e(?:-[^|]*)?)?)?)?)?\s*$', '', text)
+    text = re.sub(r'<\|[0-9a-fA-F-]*$', '', text)
     text = re.sub(r'\bfile<[^>]*$', '', text)
     text = re.sub(r'【[^】]*$', '', text)
     return text
