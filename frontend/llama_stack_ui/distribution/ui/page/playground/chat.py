@@ -99,7 +99,7 @@ def fetch_models_and_tools():
         return meta.get("model_type")
 
     model_list = [
-_get_model_id(model) for model in models
+        _get_model_id(model) for model in models
         if _get_model_type(model) == "llm" and _get_model_id(model) not in shields_set
     ]
 
