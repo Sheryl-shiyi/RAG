@@ -186,7 +186,7 @@ class TestResponseDisplay:
     
     def test_tool_debug_toggle(self, page: Page):
         """Test that tool debug toggle is visible"""
-        debug_toggle = page.get_by_text("Show Tool/Debug Info", exact=False)
+        debug_toggle = page.get_by_text("file_search tool with", exact=False)
         expect(debug_toggle).to_be_visible(timeout=TEST_TIMEOUT)
 
 
