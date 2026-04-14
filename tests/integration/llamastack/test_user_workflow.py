@@ -286,18 +286,41 @@ def test_complete_rag_workflow():
     print("🤖 Step 4: Checking for available models...")
     skip_inference = SKIP_MODEL_TESTS == "true"
     model_available = False
-    
+    model_ids = []
+
     try:
-        # Llama-stack uses /v1/openai/v1/* paths for OpenAI-compatible API
-        openai_base_url = f"{LLAMA_STACK_ENDPOINT}/v1/openai/v1"
-        client = OpenAI(
-            api_key="not_needed",
-            base_url=openai_base_url,
-            timeout=30.0
-        )
-        
-        print(f"   DEBUG: Calling {openai_base_url}/models endpoint...")
-        models = client.models.list()
+        # OpenAI-compatible base URL: current Llama Stack uses /v1 (see conftest.py).
+        # Older stacks used /v1/openai/v1 (client-examples-python/README.md).
+        endpoint = LLAMA_STACK_ENDPOINT.rstrip("/")
+        explicit_openai = os.getenv("LLAMA_STACK_OPENAI_BASE")
+        openai_base_candidates = []
+        if explicit_openai:
+            openai_base_candidates.append(explicit_openai.rstrip("/"))
+        openai_base_candidates.append(f"{endpoint}/v1")
+        openai_base_candidates.append(f"{endpoint}/v1/openai/v1")
+
+        client = None
+        openai_base_url = None
+        models = None
+        last_models_error: Exception | None = None
+        for base in openai_base_candidates:
+            candidate = OpenAI(
+                api_key="not_needed",
+                base_url=base,
+                timeout=30.0,
+            )
+            try:
+                print(f"   DEBUG: Calling {base}/models endpoint...")
+                models = candidate.models.list()
+                client = candidate
+                openai_base_url = base
+                break
+            except Exception as e:
+                last_models_error = e
+                continue
+
+        if client is None or models is None:
+            raise last_models_error or RuntimeError("Could not list models from any OpenAI base URL")
         print(f"   DEBUG: Raw response type: {type(models)}")
         print(f"   DEBUG: Number of models in response: {len(models.data)}")
         
