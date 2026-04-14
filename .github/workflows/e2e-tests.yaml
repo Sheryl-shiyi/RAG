@@ -1,18 +1,6 @@
 name: E2E Tests
 
-on:
-  pull_request:
-    branches:
-      - main
-    paths:
-      - 'frontend/**'
-      - 'deploy/helm/**'
-      - 'tests/**'
-      - '.github/workflows/e2e-tests.yaml'
-  push:
-    branches:
-      - main
-  workflow_dispatch:
+on: [pull_request, push, workflow_dispatch]
 
 # MaaS configuration - can be overridden with repository secrets for different environments
 env:
@@ -754,3 +742,67 @@ jobs:
         run: |
           pkill -f "kubectl port-forward" || true
           # kind delete cluster --name rag-e2e-ui
+
+  # Single check to mark as required in branch protection (Settings → Branches →
+  # Require status checks): "PR tests gate". Fails if unit/integration failed, or
+  # if MaaS-backed jobs ran and failed. Fork PRs may skip secret-dependent jobs.
+  pr-required-checks:
+    name: PR tests gate
+    runs-on: ubuntu-latest
+    if: always() && github.event_name == 'pull_request'
+    needs:
+      - unit-tests
+      - integration-tests
+      - llamastack-integration-tests
+      - ui-e2e-tests
+    steps:
+      - name: Enforce test job outcomes
+        env:
+          UNIT_RESULT: ${{ needs.unit-tests.result }}
+          INTEG_RESULT: ${{ needs.integration-tests.result }}
+          LLAMA_RESULT: ${{ needs.llamastack-integration-tests.result }}
+          UI_RESULT: ${{ needs.ui-e2e-tests.result }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          is_fork=false
+          if [ "${HEAD_REPO}" != "${THIS_REPO}" ]; then
+            is_fork=true
+          fi
+
+          echo "Job results: unit=${UNIT_RESULT} integration=${INTEG_RESULT} llamastack=${LLAMA_RESULT} ui-e2e=${UI_RESULT} fork=${is_fork}"
+
+          if [ "${UNIT_RESULT}" != "success" ]; then
+            echo "::error::Unit tests did not succeed (result=${UNIT_RESULT})"
+            exit 1
+          fi
+          if [ "${INTEG_RESULT}" != "success" ]; then
+            echo "::error::Integration tests (Streamlit) did not succeed (result=${INTEG_RESULT})"
+            exit 1
+          fi
+
+          allow_skipped_secret_jobs() {
+            local r="$1"
+            [ "${is_fork}" = true ] && [ "${r}" = "skipped" ]
+          }
+
+          if [ "${LLAMA_RESULT}" != "success" ]; then
+            if allow_skipped_secret_jobs "${LLAMA_RESULT}"; then
+              echo "LlamaStack integration tests were skipped (fork PR; repository secrets are not available)."
+            else
+              echo "::error::LlamaStack integration tests did not succeed (result=${LLAMA_RESULT})"
+              exit 1
+            fi
+          fi
+
+          if [ "${UI_RESULT}" != "success" ]; then
+            if allow_skipped_secret_jobs "${UI_RESULT}"; then
+              echo "UI E2E tests were skipped (fork PR; repository secrets are not available)."
+            else
+              echo "::error::UI E2E tests did not succeed (result=${UI_RESULT})"
+              exit 1
+            fi
+          fi
+
+          echo "All required test outcomes for this pull request passed."
