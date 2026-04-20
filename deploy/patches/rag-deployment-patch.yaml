@@ -1,0 +1,26 @@
+# RAG Deployment Patch
+# This patch mounts the ConfigMap to override direct.py and agent.py
+#
+# Usage (JSON patch - recommended):
+#   oc patch deployment rag -n llama-stack-rag --type=json -p='[
+#     {"op": "add", "path": "/spec/template/spec/volumes/-", "value": {"name": "rag-ui-overrides", "configMap": {"name": "rag-ui-overrides"}}},
+#     {"op": "add", "path": "/spec/template/spec/containers/0/volumeMounts/-", "value": {"name": "rag-ui-overrides", "mountPath": "/app/llama_stack_ui/distribution/ui/page/playground/direct.py", "subPath": "direct.py"}},
+#     {"op": "add", "path": "/spec/template/spec/containers/0/volumeMounts/-", "value": {"name": "rag-ui-overrides", "mountPath": "/app/llama_stack_ui/distribution/ui/page/playground/agent.py", "subPath": "agent.py"}}
+#   ]'
+
+spec:
+  template:
+    spec:
+      volumes:
+        - name: rag-ui-overrides
+          configMap:
+            name: rag-ui-overrides
+      containers:
+        - name: rag
+          volumeMounts:
+            - name: rag-ui-overrides
+              mountPath: /app/llama_stack_ui/distribution/ui/page/playground/direct.py
+              subPath: direct.py
+            - name: rag-ui-overrides
+              mountPath: /app/llama_stack_ui/distribution/ui/page/playground/agent.py
+              subPath: agent.py

@@ -1,0 +1,514 @@
+# RAG UI Override ConfigMap
+# This ConfigMap patches direct.py and agent.py to fix context window issues
+# 
+# Usage:
+#   1. Apply ConfigMap: oc apply -f rag-ui-overrides-configmap.yaml -n llama-stack-rag
+#   2. Patch deployment (first time only): see README.md for JSON patch command
+#   3. Restart: oc rollout restart deployment/rag -n llama-stack-rag
+#
+# Parameters to adjust:
+#   - MAX_NUM_RESULTS: Number of search results (lower = less input tokens)
+#   - MAX_TOKENS: Max output tokens (lower = more room for input)
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-ui-overrides
+  labels:
+    app: rag
+    component: ui-patches
+data:
+  direct.py: |
+    # Copyright (c) Meta Platforms, Inc. and affiliates.
+    # Direct mode implementation with context limits fix
+    
+    import logging
+    import traceback
+    import streamlit as st
+    from llama_stack_ui.distribution.ui.modules.api import llama_stack_api
+    from llama_stack_ui.distribution.ui.modules.utils import clean_text, get_vector_db_name
+    
+    logger = logging.getLogger(__name__)
+    
+    # ============================================================================
+    # Context Limits - Adjust based on your model's context window
+    # For gemma-3-27b with max-model-len=11000:
+    #   - MAX_NUM_RESULTS=3 keeps input around 3000-4000 tokens
+    #   - MAX_TOKENS=512 leaves plenty of room for input
+    # ============================================================================
+    MAX_NUM_RESULTS = 4   # Limit search results to reduce input tokens
+    MAX_TOKENS = 1000     # Limit output tokens
+    
+    # ============================================================================
+    # Direct Mode - Helper Functions
+    # ============================================================================
+    
+    def extract_text_from_search_result(result):
+        """Extract and clean text content from a search result object."""
+        text = None
+        if hasattr(result, 'content') and isinstance(result.content, list):
+            for content_item in result.content:
+                if hasattr(content_item, 'text'):
+                    text = content_item.text
+                    break
+        elif hasattr(result, 'content') and isinstance(result.content, str):
+            text = result.content
+        elif isinstance(result, dict) and 'content' in result:
+            if isinstance(result['content'], list) and result['content']:
+                text = result['content'][0].get('text', '')
+            else:
+                text = result['content']
+        return clean_text(text) if text else None
+    
+    
+    def search_vector_store_direct(prompt, vector_db_id, vector_db_name, state):
+        """Search vector store and extract context for Direct mode."""
+        search_results = []
+        context_parts = []
+        display_results = []
+    
+        with state.containers.tool_status:
+            st.markdown(f"🛠 :grey[_Searching vector store: {vector_db_name}_]")
+    
+        logger.debug("Searching vector store %s with query: %s", vector_db_id, prompt)
+    
+        # FIXED: Add max_num_results to limit context size
+        search_response = llama_stack_api.client.vector_stores.search(
+            vector_store_id=vector_db_id,
+            query=prompt,
+            max_num_results=MAX_NUM_RESULTS,
+        )
+    
+        logger.debug("Search response: %s", search_response)
+    
+        if hasattr(search_response, 'data') and search_response.data:
+            search_results = search_response.data
+        elif hasattr(search_response, 'chunks') and search_response.chunks:
+            search_results = search_response.chunks
+        elif hasattr(search_response, 'results') and search_response.results:
+            search_results = search_response.results
+    
+        if search_results:
+            for result in search_results:
+                text_content = extract_text_from_search_result(result)
+                if text_content:
+                    attrs = getattr(result, 'attributes', {})
+                    source = attrs.get('source') or getattr(result, 'filename', 'unknown')
+                    context_parts.append(f"[Source: {source}]: {text_content}")
+                    display_results.append({"source": source, "text": text_content})
+    
+            with state.containers.tool_results:
+                with st.expander(f"📄 Search Results from '{vector_db_name}'", expanded=False):
+                    st.json(display_results)
+    
+            logger.debug("Built context with %s documents", len(context_parts))
+        else:
+            with state.containers.tool_results:
+                st.info(f"No results found in '{vector_db_name}'")
+    
+        return search_results, context_parts, display_results
+    
+    
+    def build_rag_messages(prompt, context_parts, system_prompt):
+        """Build messages for LLM - with or without RAG context."""
+        if context_parts:
+            context = "\n\n".join(context_parts)
+            extended_prompt = (
+                f"Please answer the following query using the context below.\n\n"
+                f"CONTEXT:\n{context}\n\n"
+                f"QUERY:\n{prompt}"
+            )
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": extended_prompt}
+            ]
+            logger.debug(
+                "Built RAG prompt with %s documents, total context length: %s",
+                len(context_parts), len(context)
+            )
+        else:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ]
+            logger.debug("No context - using normal chat mode")
+        return messages
+    
+    
+    def stream_completions_direct(completion_response, state):
+        """Stream chunks from Completions API and update state."""
+        for chunk in completion_response:
+            logger.debug("Completion chunk: %s", chunk)
+            if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
+                delta = chunk.choices[0].delta
+                if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                    state.update_reasoning(delta.reasoning_content)
+                if hasattr(delta, 'content') and delta.content:
+                    state.update_message(delta.content)
+    
+    
+    def save_direct_response_to_session(state, all_search_results):
+        """Save direct response to session state."""
+        state.finalize_reasoning()
+        state.finalize_message()
+    
+        response_dict = {
+            "role": "assistant",
+            "content": state.full_response,
+            "stop_reason": "end_of_message"
+        }
+    
+        if state.reasoning_text:
+            response_dict["reasoning"] = state.reasoning_text
+    
+        if all_search_results:
+            db_names = [name for name, _ in all_search_results]
+            response_dict["tool_results"] = [
+                {
+                    'title': f"📄 Search Results from '{name}'",
+                    'type': 'json',
+                    'content': display
+                }
+                for name, display in all_search_results
+            ]
+            response_dict["tool_status"] = (
+                f"🛠 :grey[_Searched vector stores: {', '.join(db_names)}_]"
+            )
+    
+        st.session_state.messages.append(response_dict)
+    
+    
+    # ============================================================================
+    # Direct Mode - Main Function (exported)
+    # ============================================================================
+    
+    def direct_process_prompt(prompt, state, config):
+        """Direct mode: Manual RAG with completions API."""
+        context_parts = []
+        all_search_results = []
+    
+        vector_dbs = st.session_state.get("direct_vector_dbs", [])
+        if not vector_dbs:
+            logger.debug("No vector DB selected - normal chat mode")
+    
+        try:
+            # Step 1: Search each selected vector store
+            for vector_db in vector_dbs:
+                vector_db_id = vector_db.id
+                vector_db_name = get_vector_db_name(vector_db)
+                search_results, parts, display = search_vector_store_direct(
+                    prompt, vector_db_id, vector_db_name, state
+                )
+                if search_results:
+                    all_search_results.append((vector_db_name, display))
+                context_parts.extend(parts)
+    
+            # Step 2: Build messages (with or without RAG context)
+            messages = build_rag_messages(prompt, context_parts, config.system_prompt)
+    
+            # Step 3: Call completions API
+            logger.debug("Calling completions API with %s messages", len(messages))
+            for i, msg in enumerate(messages):
+                logger.debug("  Message %s (%s): %s...", i, msg['role'], msg['content'][:200])
+    
+            # FIXED: Add max_tokens to limit output
+            completion_response = llama_stack_api.client.chat.completions.create(
+                model=config.model,
+                messages=messages,
+                temperature=config.sampling.temperature,
+                max_tokens=MAX_TOKENS,
+                stream=True,
+            )
+    
+            # Step 4: Stream response and update UI
+            stream_completions_direct(completion_response, state)
+    
+            # Step 5: Save to session
+            save_direct_response_to_session(state, all_search_results)
+    
+        except Exception as e:
+            st.error(f"Error in Direct mode: {str(e)}")
+            logger.debug("Direct mode error: %s", e)
+            logger.debug("%s", traceback.format_exc())
+
+  agent.py: |
+    # Copyright (c) Meta Platforms, Inc. and affiliates.
+    # Agent mode implementation with context limits fix
+    
+    import logging
+    import streamlit as st
+    from llama_stack_ui.distribution.ui.modules.api import llama_stack_api
+    from llama_stack_ui.distribution.ui.modules.utils import clean_text, get_vector_db_name
+    
+    logger = logging.getLogger(__name__)
+    
+    # ============================================================================
+    # Context Limits - Must match direct.py settings
+    # ============================================================================
+    MAX_NUM_RESULTS = 4   # Limit file_search results
+    
+    
+    def build_response_tools(toolgroup_selection, selected_vector_dbs, client):
+        """Convert toolgroup selections to LlamaStack Responses API compatible tool format."""
+        agent_tools = []
+    
+        for toolgroup_name in toolgroup_selection:
+            if toolgroup_name == "builtin::rag":
+                if len(selected_vector_dbs) > 0:
+                    vector_dbs = client.vector_stores.list() or []
+                    vector_db_ids = [
+                        vector_db.id for vector_db in vector_dbs
+                        if get_vector_db_name(vector_db) in selected_vector_dbs
+                    ]
+                    # FIXED: Add max_num_results to limit context size
+                    agent_tools.append({
+                        "type": "file_search",
+                        "vector_store_ids": list(vector_db_ids),
+                        "max_num_results": MAX_NUM_RESULTS,
+                    })
+            elif "web_search" in toolgroup_name or "search" in toolgroup_name.lower():
+                agent_tools.append({"type": "web_search"})
+            elif toolgroup_name.startswith("mcp::"):
+                try:
+                    toolgroups = client.toolgroups.list()
+                    for toolgroup in toolgroups:
+                        if str(toolgroup.identifier) == toolgroup_name:
+                            agent_tools.append({
+                                "type": "mcp",
+                                "server_label": toolgroup.args.get("name", str(toolgroup.identifier)),
+                                "server_url": toolgroup.mcp_endpoint.uri,
+                            })
+                            break
+                except Exception as e:
+                    logger.debug("Failed to get MCP server info for %s: %s", toolgroup_name, e)
+            else:
+                try:
+                    tools_in_group = client.tools.list(toolgroup_id=toolgroup_name)
+                    for tool in tools_in_group:
+                        agent_tools.append({
+                            "type": "function",
+                            "function": {
+                                "name": tool.name,
+                                "description": tool.description or "",
+                                "parameters": tool.parameters or {}
+                            }
+                        })
+                except Exception as e:
+                    logger.debug("Failed to get tools for %s: %s", toolgroup_name, e)
+    
+        return agent_tools
+    
+    
+    def handle_agent_file_search_chunk(state, selected_vector_dbs):
+        """Handle file_search tool chunk in agent mode."""
+        if state.tool_used:
+            return
+        if selected_vector_dbs:
+            db_label = "vector store" if len(selected_vector_dbs) == 1 else "vector stores"
+            status_msg = f"🛠 :grey[_Using file_search tool with {db_label}: {', '.join(selected_vector_dbs)}_]"
+        else:
+            status_msg = "🛠 :grey[_Using file_search tool..._]"
+        state.tool_status = status_msg
+        with state.containers.tool_status:
+            st.markdown(status_msg)
+    
+    
+    def handle_agent_web_search_chunk(state):
+        """Handle web_search tool chunk in agent mode."""
+        if state.tool_used:
+            return
+        status_msg = "🛠 :grey[_Using web_search tool..._]"
+        state.tool_status = status_msg
+        with state.containers.tool_status:
+            st.markdown(status_msg)
+    
+    
+    def handle_agent_output_item_done(chunk, state):
+        """Handle response.output_item.done - tool execution completion with results."""
+        if not hasattr(chunk, 'item'):
+            return
+        item = chunk.item
+        item_type = getattr(item, 'type', None)
+    
+        if item_type == "file_search_call":
+            if hasattr(item, 'results') and item.results:
+                display_results = []
+                for r in item.results:
+                    text = getattr(r, 'text', '')
+                    attrs = getattr(r, 'attributes', {})
+                    source = attrs.get('source') or getattr(r, 'filename', 'unknown')
+                    display_results.append({"source": source, "text": clean_text(text)})
+                state.tool_results.append({
+                    'title': '📄 File Search Results',
+                    'type': 'json',
+                    'content': display_results
+                })
+                with state.containers.tool_results:
+                    with st.expander("📄 File Search Results", expanded=False):
+                        st.json(display_results)
+        elif item_type == "web_search_call":
+            pass
+        elif item_type == "function_call":
+            if hasattr(item, 'output') and item.output:
+                tool_name = getattr(item, 'name', 'function')
+                state.tool_results.append({
+                    'title': f'🔧 Tool Output: {tool_name}',
+                    'type': 'code',
+                    'content': str(item.output)
+                })
+                with state.containers.tool_results:
+                    with st.expander(f"🔧 Tool Output: {tool_name}", expanded=False):
+                        st.code(str(item.output))
+        elif item_type == "mcp_call":
+            if hasattr(item, 'output') and item.output:
+                tool_name = getattr(item, 'name', 'mcp')
+                state.tool_results.append({
+                    'title': f'🔧 MCP Tool Output: {tool_name}',
+                    'type': 'code',
+                    'content': str(item.output)
+                })
+                with state.containers.tool_results:
+                    with st.expander(f"🔧 MCP Tool Output: {tool_name}", expanded=False):
+                        st.code(str(item.output))
+        elif item_type and item_type.endswith("_call"):
+            if hasattr(item, 'results') and item.results:
+                formatted_name = item_type.replace("_", " ").title()
+                state.tool_results.append({
+                    'title': f'🔧 {formatted_name} Results',
+                    'type': 'json',
+                    'content': item.results
+                })
+                with state.containers.tool_results:
+                    with st.expander(f"🔧 {formatted_name} Results", expanded=False):
+                        st.json(item.results)
+            elif hasattr(item, 'output') and item.output:
+                formatted_name = item_type.replace("_", " ").title()
+                state.tool_results.append({
+                    'title': f'🔧 {formatted_name} Output',
+                    'type': 'json',
+                    'content': item.output
+                })
+                with state.containers.tool_results:
+                    with st.expander(f"🔧 {formatted_name} Output", expanded=False):
+                        st.json(item.output)
+    
+    
+    def handle_chunk_error(chunk):
+        """Handle error chunk and return whether to stop streaming."""
+        error_msg = "Unknown error"
+        error_code = None
+        if hasattr(chunk, 'error') and chunk.error:
+            if hasattr(chunk.error, 'message'):
+                error_msg = chunk.error.message
+            if hasattr(chunk.error, 'code'):
+                error_code = chunk.error.code
+        elif hasattr(chunk, 'error_message'):
+            error_msg = chunk.error_message
+        error_display = f"❌ Error: {error_msg}"
+        if error_code:
+            error_display += f" (Code: {error_code})"
+        st.error(error_display)
+        logger.debug("Response failed: %s", error_msg)
+        return True
+    
+    
+    def handle_chunk_completed(chunk):
+        """Handle completed chunk."""
+        logger.debug("Response completed successfully")
+        if hasattr(chunk, 'stop_reason'):
+            logger.debug("Stop reason: %s", chunk.stop_reason)
+    
+    
+    def handle_chunk_done(chunk, state):
+        """Handle done chunk and finalize response."""
+        has_output = (
+            hasattr(chunk, 'response') and
+            hasattr(chunk.response, 'output_text') and
+            chunk.response.output_text
+        )
+        if has_output:
+            state.full_response = chunk.response.output_text
+    
+    
+    def process_chunk_by_type(chunk, state, selected_vector_dbs):
+        """Process a single chunk based on its type. Returns True to stop streaming."""
+        chunk_type = chunk.type
+    
+        if chunk_type == "response.file_search_call.in_progress":
+            handle_agent_file_search_chunk(state, selected_vector_dbs)
+        elif chunk_type == "response.web_search_call.in_progress":
+            handle_agent_web_search_chunk(state)
+        elif chunk_type in ("response.web_search_call.searching", "response.web_search_call.completed"):
+            pass
+        elif chunk_type == "response.output_item.done":
+            handle_agent_output_item_done(chunk, state)
+        elif chunk_type == "response.reasoning_text.delta":
+            if hasattr(chunk, 'delta') and chunk.delta:
+                state.update_reasoning(chunk.delta)
+        elif chunk_type == "response.output_text.delta":
+            if hasattr(chunk, 'delta') and chunk.delta:
+                state.update_message(chunk.delta)
+        elif chunk_type == "response.failed":
+            return handle_chunk_error(chunk)
+        elif chunk_type == "response.completed":
+            handle_chunk_completed(chunk)
+        elif chunk_type == "response.done":
+            handle_chunk_done(chunk, state)
+        return False
+    
+    
+    def stream_agent_response(response, state, selected_vector_dbs):
+        """Stream and process chunks from Responses API."""
+        chunk_count = 0
+        for chunk in response:
+            chunk_count += 1
+            logger.debug("Chunk #%s: type=%s", chunk_count, getattr(chunk, 'type', 'NO_TYPE'))
+            logger.debug("  -> Full chunk: %s", chunk)
+            if hasattr(chunk, 'type'):
+                should_stop = process_chunk_by_type(chunk, state, selected_vector_dbs)
+                if should_stop:
+                    break
+    
+    
+    def save_agent_response_to_session(state):
+        """Save agent response to session state."""
+        state.finalize_reasoning()
+        state.finalize_message()
+        response_dict = {
+            "role": "assistant",
+            "content": state.full_response,
+            "stop_reason": "end_of_message"
+        }
+        if state.reasoning_text:
+            response_dict["reasoning"] = state.reasoning_text
+        if state.tool_status:
+            response_dict["tool_status"] = state.tool_status
+        if state.tool_results:
+            response_dict["tool_results"] = state.tool_results
+        st.session_state.messages.append(response_dict)
+    
+    
+    def agent_process_prompt(prompt, state, config):
+        """Agent-based mode: Use Responses API with automatic tool calling."""
+        tools = build_response_tools(
+            config.toolgroup_selection, config.selected_vector_dbs, llama_stack_api.client
+        ) if config.toolgroup_selection else None
+    
+        request_kwargs = {
+            "model": config.model,
+            "instructions": config.system_prompt,
+            "input": prompt,
+            "conversation": config.conversation_id,
+            "temperature": config.sampling.temperature,
+            "max_infer_iters": config.sampling.max_infer_iters,
+            "stream": True,
+        }
+    
+        if tools:
+            request_kwargs["tools"] = tools
+    
+        logger.debug("Request: %s", request_kwargs)
+        response = llama_stack_api.client.responses.create(**request_kwargs)
+    
+        stream_agent_response(response, state, config.selected_vector_dbs)
+        save_agent_response_to_session(state)
