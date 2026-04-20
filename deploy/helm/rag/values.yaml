@@ -3,7 +3,7 @@ replicaCount: 1
 image:
   repository: quay.io/rh-ai-quickstart/llamastack-dist-ui
   pullPolicy: Always
-  tag: 0.2.39
+  tag: 0.2.43
 
 service:
   type: ClusterIP
@@ -164,7 +164,7 @@ pgvector:
     dbname: rag_blueprint
     host: pgvector
     port: "5432"
-  
+
     # Upload sample files to the minio bucket 
   sampleFileUpload:
     enabled: true
@@ -176,6 +176,12 @@ pgvector:
 
 llama-stack:
   enabled: true
+  fileProcessors:
+    enabled: true
+    providers:
+      - provider_id: pypdf
+        provider_type: inline::pypdf
+
   secrets:
     TAVILY_SEARCH_API_KEY: "Paste-your-key-here"
 

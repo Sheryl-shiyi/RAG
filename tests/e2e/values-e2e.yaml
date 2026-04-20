@@ -94,6 +94,12 @@ llama-stack:
   # Don't wait for models - they're external via MaaS
   skipModelWait: true
 
+  fileProcessors:
+    enabled: true
+    providers:
+      - provider_id: pypdf
+        provider_type: inline::pypdf
+
 # Disable components that require OpenShift/KServe CRDs
 llm-service:
   enabled: false

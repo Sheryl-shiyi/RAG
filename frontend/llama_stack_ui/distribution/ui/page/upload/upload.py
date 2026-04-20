@@ -11,6 +11,12 @@ import traceback
 import streamlit as st
 
 from llama_stack_ui.distribution.ui.modules.api import llama_stack_api
+from llama_stack_ui.distribution.ui.modules.local_extractors import (
+    LOCAL_SUPPORTED_EXTENSIONS,
+    PROVIDER_SUPPORTED_EXTENSIONS,
+    create_text_file_from_extracted_content,
+    extract_text,
+)
 from llama_stack_ui.distribution.ui.modules.utils import get_vector_db_name
 
 
@@ -21,6 +27,7 @@ def _init_upload_page_session_state():
         "creation_message": "",
         "selected_vector_db": "",
         "newly_created_vdb": None,
+        "extraction_method": "provider",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -189,6 +196,9 @@ def _create_vector_database(vdb_name):
 def _show_document_upload_ui(vector_db_name, vector_db_obj=None):
     """Display UI for uploading documents to an existing vector database.
 
+    Shows an extraction method toggle that determines which file types are
+    accepted and how they are processed before ingestion.
+
     Args:
         vector_db_name (str): Name of the selected vector database
         vector_db_obj: The actual vector database object with identifier
@@ -200,6 +210,33 @@ def _show_document_upload_ui(vector_db_name, vector_db_obj=None):
 
     _show_status("upload_status", "upload_message")
 
+    local_label = (
+        "Docling ("
+        + ", ".join(LOCAL_SUPPORTED_EXTENSIONS) + ")"
+    )
+    provider_label = (
+        "LlamaStack Provider ("
+        + ", ".join(PROVIDER_SUPPORTED_EXTENSIONS) + ")"
+    )
+    method_options = [provider_label, local_label]
+
+    selected_label = st.radio(
+        "Extraction method",
+        method_options,
+        key="extraction_method_radio",
+        horizontal=False,
+        help="Local extraction converts .docx/.xlsx to text in the browser. "
+             "LlamaStack Provider sends files directly to the server.",
+    )
+
+    is_local = selected_label == local_label
+    st.session_state["extraction_method"] = "local" if is_local else "provider"
+
+    if is_local:
+        accepted_types = [ext.lstrip(".") for ext in LOCAL_SUPPORTED_EXTENSIONS]
+    else:
+        accepted_types = [ext.lstrip(".") for ext in PROVIDER_SUPPORTED_EXTENSIONS]
+
     upload_key = f"processed_files_{vector_db_name}"
     if upload_key not in st.session_state:
         st.session_state[upload_key] = set()
@@ -207,19 +244,23 @@ def _show_document_upload_ui(vector_db_name, vector_db_obj=None):
     uploaded_files = st.file_uploader(
         "Browse and select files to upload (files will upload automatically)",
         accept_multiple_files=True,
-        type=["txt", "pdf", "doc", "docx", "md"],
-        key=f"uploader_{vector_db_name}",
+        type=accepted_types,
+        key=f"uploader_{vector_db_name}_{st.session_state['extraction_method']}",
         help=(
-            "Select one or more documents - they will be uploaded "
+            "Select one or more documents — they will be uploaded "
             "automatically to this vector database"
         ),
     )
 
     if uploaded_files:
-        file_set_id = frozenset([f.name + str(f.size) for f in uploaded_files])
+        new_files = [
+            f for f in uploaded_files
+            if f.name + str(f.size) not in st.session_state[upload_key]
+        ]
 
-        if file_set_id not in st.session_state[upload_key]:
-            st.session_state[upload_key].add(file_set_id)
+        if new_files:
+            for f in new_files:
+                st.session_state[upload_key].add(f.name + str(f.size))
 
             if vector_db_obj and hasattr(vector_db_obj, 'id'):
                 vector_db_id = vector_db_obj.id
@@ -227,17 +268,24 @@ def _show_document_upload_ui(vector_db_name, vector_db_obj=None):
                 vector_db_id = vector_db_name
 
             _upload_documents_to_database(
-                vector_db_name, uploaded_files, vector_db_id
+                vector_db_name,
+                new_files,
+                vector_db_id,
+                extraction_method=st.session_state["extraction_method"],
             )
 
-
-def _upload_documents_to_database(vector_db_name, uploaded_files, vector_db_id=None):
+def _upload_documents_to_database(vector_db_name, uploaded_files, vector_db_id=None, extraction_method="provider"):
     """Upload documents to an existing vector database.
+
+    When extraction_method is "local", files are first converted to plain text
+    using the local extractors and the resulting .txt content is uploaded.
+    When "provider", files are sent directly to the LlamaStack server.
 
     Args:
         vector_db_name (str): Name of the target vector database
         uploaded_files: List of uploaded files from Streamlit file uploader
         vector_db_id (str): The actual database identifier for API calls
+        extraction_method (str): "local" for client-side extraction, "provider" for server-side
     """
     try:
         st.session_state["upload_status"] = None
@@ -251,16 +299,37 @@ def _upload_documents_to_database(vector_db_name, uploaded_files, vector_db_id=N
         actual_db_id = vector_db_id or vector_db_name
         uploaded_file_ids = []
 
-        with st.spinner(f"Uploading {len(uploaded_files)} file(s)..."):
+        spinner_msg = (
+            f"Extracting and uploading {len(uploaded_files)} file(s)..."
+            if extraction_method == "local"
+            else f"Uploading {len(uploaded_files)} file(s)..."
+        )
+
+        with st.spinner(spinner_msg):
             for uploaded_file in uploaded_files:
+                original_filename = uploaded_file.name
+
+                if extraction_method == "local":
+                    text_content = extract_text(uploaded_file, original_filename)
+                    file_to_upload = create_text_file_from_extracted_content(
+                        text_content, original_filename
+                    )
+                else:
+                    file_to_upload = uploaded_file
+
                 file_response = llama_stack_api.client.files.create(
-                    file=uploaded_file,
+                    file=file_to_upload,
                     purpose="assistants"
                 )
-                llama_stack_api.client.vector_stores.files.create(
-                    vector_store_id=actual_db_id,
-                    file_id=file_response.id,
-                )
+
+                vs_file_kwargs = {
+                    "vector_store_id": actual_db_id,
+                    "file_id": file_response.id,
+                }
+                if extraction_method == "local":
+                    vs_file_kwargs["attributes"] = {"source": original_filename}
+
+                llama_stack_api.client.vector_stores.files.create(**vs_file_kwargs)
                 uploaded_file_ids.append(file_response.id)
 
         st.session_state["upload_status"] = "success"

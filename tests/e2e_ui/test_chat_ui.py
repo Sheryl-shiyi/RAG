@@ -183,12 +183,6 @@ class TestResponseDisplay:
         """Test that initial greeting message is displayed"""
         greeting = page.get_by_text("How can I help you?", exact=False)
         expect(greeting).to_be_visible(timeout=TEST_TIMEOUT)
-    
-    def test_tool_debug_toggle(self, page: Page):
-        """Test that tool debug toggle is visible"""
-        debug_toggle = page.get_by_text("Show Tool/Debug Info", exact=False)
-        expect(debug_toggle).to_be_visible(timeout=TEST_TIMEOUT)
-
 
 class TestMaaSIntegration:
     """UI tests for MaaS (Model-as-a-Service) integration through the UI

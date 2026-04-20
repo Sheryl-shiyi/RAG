@@ -103,7 +103,7 @@ global:
     # To configure LlamaStack with remote llm, replace the id,
     # url and apiToken value and set enabled to true
 
-    # remote-llm:
+    # remotellm:
     #   id: custom-model-id
     #   url: https://custom-server-url/v1
     #   apiToken: fake-token
@@ -179,6 +179,17 @@ llama-stack:
     # Add other API keys as needed
     # OPENAI_API_KEY: "your_openai_key_here"
     # ANTHROPIC_API_KEY: "your_anthropic_key_here"
+
+  # File Processors Configuration
+  #
+  # Available providers:
+  #   inline::pypdf        - PDF extraction (lightweight, uses PyPDF)
+  #
+  fileProcessors:
+    enabled: true
+    providers:
+      - provider_id: pypdf
+        provider_type: inline::pypdf
 
 # Suggested Questions Configuration
 # These questions appear in the chat UI when users select a database
