@@ -1,6 +1,18 @@
 name: E2E Tests
 
-on: [pull_request, push, workflow_dispatch]
+on:
+  pull_request:
+    branches:
+      - dev
+      - main
+  push:
+    branches:
+      - dev
+      - main
+  workflow_dispatch:
+  schedule:
+    # Daily at 10:00 UTC. GitHub Actions does not support local timezones for cron.
+    - cron: "0 10 * * *"
 
 # MaaS configuration - can be overridden with repository secrets for different environments
 env:
@@ -76,7 +88,7 @@ jobs:
     timeout-minutes: 60
     needs: unit-tests
     # Skip this job for fork PRs since secrets are not available
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     
     steps:
       - name: Checkout repository
@@ -511,7 +523,14 @@ jobs:
     timeout-minutes: 60
     needs: [unit-tests, integration-tests]
     # Skip this job for fork PRs since secrets are not available
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: |
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
     
     steps:
       - name: Checkout repository
